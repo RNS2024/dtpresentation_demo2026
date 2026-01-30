@@ -1,0 +1,463 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Khlong Toei — Digital Twin (3D + AQI)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- MapLibre GL -->
+  <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+
+  <!-- Turf (for bbox / helper) -->
+  <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+
+  <style>
+    html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    #map { position: absolute; inset: 0; }
+
+    .panel {
+      position: absolute;
+      left: 16px; top: 16px;
+      width: 340px;
+      background: rgba(255,255,255,0.92);
+      border: 1px solid rgba(0,0,0,0.12);
+      border-radius: 14px;
+      padding: 14px 14px 10px 14px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.18);
+      z-index: 10;
+    }
+    .title { font-weight: 800; font-size: 20px; margin: 0 0 2px 0; }
+    .subtitle { color: #444; font-size: 12.5px; margin: 0 0 10px 0; }
+
+    .row { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
+    .row label { font-size: 13px; color: #222; width: 90px; }
+    select { flex: 1; padding: 7px 10px; border-radius: 10px; border: 1px solid rgba(0,0,0,0.2); background:#fff; }
+
+    .btn {
+      border: 1px solid rgba(0,0,0,0.15);
+      border-radius: 12px;
+      padding: 8px 12px;
+      background: #111;
+      color: #fff;
+      cursor: pointer;
+      font-size: 12.5px;
+      font-weight: 700;
+    }
+    .btn.secondary { background: #f2f2f2; color: #111; }
+    .btn:active { transform: translateY(1px); }
+
+    .checkbox { display:flex; align-items:center; gap:8px; font-size: 13px; color:#222; margin: 7px 0; }
+    .slider { width: 100%; }
+    .legend { margin-top: 8px; font-size: 12px; color:#333; }
+    .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; }
+    .tip { font-size: 11.5px; color:#444; margin-top: 6px; line-height: 1.25; }
+
+    /* Make MapLibre controls bigger for Chromebook */
+    .maplibregl-ctrl-group button { width: 36px; height: 36px; }
+  </style>
+</head>
+
+<body>
+  <div id="map"></div>
+
+  <div class="panel">
+    <div class="title">Khlong Toei — Digital Twin</div>
+    <div class="subtitle">OSM 3D buildings (Overpass) + AQI overlay (simulated)</div>
+
+    <div class="row">
+      <button class="btn secondary" id="resetBtn">Reset</button>
+      <button class="btn" id="go3dBtn">Go 3D</button>
+      <button class="btn secondary" id="topBtn">Top-down</button>
+    </div>
+
+    <div class="row">
+      <label>Basemap:</label>
+      <select id="basemapSel">
+        <option value="light">Street (Light)</option>
+        <option value="dark">Street (Dark)</option>
+        <option value="sat">Satellite</option>
+      </select>
+    </div>
+
+    <div class="checkbox">
+      <input type="checkbox" id="bldChk" checked />
+      <label for="bldChk">Show 3D buildings</label>
+    </div>
+
+    <div class="checkbox">
+      <input type="checkbox" id="aqiChk" checked />
+      <label for="aqiChk">Show AQI overlay</label>
+    </div>
+
+    <div class="row">
+      <label>AQI intensity</label>
+    </div>
+    <input type="range" class="slider" id="aqiInt" min="0" max="100" value="70" />
+
+    <div class="row" style="margin-top:10px;">
+      <label>AQI animation</label>
+    </div>
+    <input type="range" class="slider" id="aqiAnim" min="0" max="100" value="40" />
+
+    <div class="legend">
+      <div><span class="dot" style="background:#22c55e;"></span>Good</div>
+      <div><span class="dot" style="background:#f59e0b;"></span>Moderate</div>
+      <div><span class="dot" style="background:#ef4444;"></span>Poor</div>
+    </div>
+
+    <div class="tip">
+      How to see 3D clearly:<br/>
+      1) Click <b>Go 3D</b><br/>
+      2) Zoom in (street level) and tilt<br/>
+      3) Satellite is heavier—use Street if slow
+    </div>
+  </div>
+
+<script>
+  // ------------------------------
+  // Area: Khlong Toei (approx bbox)
+  // You can adjust later
+  // ------------------------------
+  const CENTER = [100.563, 13.720]; // lon, lat
+  const ZOOM_START = 13.4;
+  const BBOX = {
+    // west, south, east, north
+    w: 100.520,
+    s: 13.690,
+    e: 100.600,
+    n: 13.760
+  };
+
+  // ------------------------------
+  // Basemap style: 3 raster sources
+  // ------------------------------
+  const STYLE = {
+    version: 8,
+    glyphs: "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
+    sources: {
+      light: {
+        type: "raster",
+        tiles: [
+          "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+          "https://b.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"
+        ],
+        tileSize: 256
+      },
+      dark: {
+        type: "raster",
+        tiles: [
+          "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+          "https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"
+        ],
+        tileSize: 256
+      },
+      sat: {
+        type: "raster",
+        tiles: [
+          "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+        ],
+        tileSize: 256
+      }
+    },
+    layers: [
+      { id: "light", type: "raster", source: "light" },
+      { id: "dark", type: "raster", source: "dark", layout: { visibility: "none" } },
+      { id: "sat", type: "raster", source: "sat", layout: { visibility: "none" } }
+    ]
+  };
+
+  // ------------------------------
+  // Map init
+  // ------------------------------
+  const map = new maplibregl.Map({
+    container: "map",
+    style: STYLE,
+    center: CENTER,
+    zoom: ZOOM_START,
+    pitch: 55,
+    bearing: -20,
+    antialias: true
+  });
+
+  // Controls (zoom/rotate)
+  map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "top-right");
+
+  // ------------------------------
+  // UI refs
+  // ------------------------------
+  const basemapSel = document.getElementById("basemapSel");
+  const bldChk = document.getElementById("bldChk");
+  const aqiChk = document.getElementById("aqiChk");
+  const aqiInt = document.getElementById("aqiInt");
+  const aqiAnim = document.getElementById("aqiAnim");
+  const resetBtn = document.getElementById("resetBtn");
+  const go3dBtn = document.getElementById("go3dBtn");
+  const topBtn = document.getElementById("topBtn");
+
+  // ------------------------------
+  // Basemap switch
+  // ------------------------------
+  function setBasemap(id) {
+    ["light","dark","sat"].forEach(x => map.setLayoutProperty(x, "visibility", "none"));
+    map.setLayoutProperty(id, "visibility", "visible");
+  }
+  basemapSel.onchange = () => setBasemap(basemapSel.value);
+
+  // ------------------------------
+  // Overpass: fetch building footprints with optional height
+  // ------------------------------
+  function overpassQueryBuildings(bbox) {
+    // OSM uses south,west,north,east
+    const s = bbox.s, w = bbox.w, n = bbox.n, e = bbox.e;
+
+    return `
+      [out:json][timeout:60];
+      (
+        way["building"](${s},${w},${n},${e});
+        relation["building"](${s},${w},${n},${e});
+      );
+      out body;
+      >;
+      out skel qt;
+    `;
+  }
+
+  function parseOverpassToGeoJSON(osm) {
+    // Minimal OSM->GeoJSON for polygons
+    const nodes = new Map();
+    const ways = new Map();
+
+    (osm.elements || []).forEach(el => {
+      if (el.type === "node") nodes.set(el.id, [el.lon, el.lat]);
+      if (el.type === "way") ways.set(el.id, el);
+    });
+
+    const features = [];
+
+    (osm.elements || []).forEach(el => {
+      if (el.type !== "way") return;
+      if (!el.tags || !el.tags.building) return;
+      if (!el.nodes || el.nodes.length < 4) return;
+
+      const coords = el.nodes.map(id => nodes.get(id)).filter(Boolean);
+      if (coords.length < 4) return;
+
+      // Ensure closed polygon
+      const first = coords[0], last = coords[coords.length - 1];
+      if (!last || first[0] !== last[0] || first[1] !== last[1]) coords.push(first);
+
+      // Height logic
+      const hTag = el.tags.height;
+      const lvl = el.tags["building:levels"];
+      let height = null;
+
+      if (hTag) {
+        const m = String(hTag).match(/([\d.]+)/);
+        if (m) height = parseFloat(m[1]);
+      } else if (lvl) {
+        const m = String(lvl).match(/([\d.]+)/);
+        if (m) height = parseFloat(m[1]) * 3.0;
+      } else {
+        // fallback: random-ish but stable
+        height = 8 + (el.id % 25) * 1.2;
+      }
+
+      features.push({
+        type: "Feature",
+        geometry: { type: "Polygon", coordinates: [coords] },
+        properties: {
+          osm_id: el.id,
+          building: el.tags.building,
+          name: el.tags.name || "",
+          height_m: height
+        }
+      });
+    });
+
+    return { type: "FeatureCollection", features };
+  }
+
+  // ------------------------------
+  // AQI: simulated points -> heat circles
+  // ------------------------------
+  function seededRand(seed) {
+    let t = seed + 0x6D2B79F5;
+    return function() {
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function makeAqiPoints(bbox, count=120) {
+    const rnd = seededRand(42);
+    const pts = [];
+    for (let i=0; i<count; i++) {
+      const lon = bbox.w + rnd() * (bbox.e - bbox.w);
+      const lat = bbox.s + rnd() * (bbox.n - bbox.s);
+      const base = rnd(); // 0..1
+      // 0=good,1=bad
+      pts.push({ lon, lat, base });
+    }
+    return pts;
+  }
+
+  const aqiPts = makeAqiPoints(BBOX, 140);
+
+  function aqiColor(v) {
+    // v 0..1
+    if (v < 0.33) return "#22c55e"; // green
+    if (v < 0.66) return "#f59e0b"; // orange
+    return "#ef4444"; // red
+  }
+
+  // ------------------------------
+  // Build layers once map is ready
+  // ------------------------------
+  map.on("load", async () => {
+    // 1) Fetch buildings
+    const query = overpassQueryBuildings(BBOX);
+
+    // Use a stable Overpass endpoint
+    const overpassUrl = "https://overpass-api.de/api/interpreter";
+
+    let buildingsGeo = { type:"FeatureCollection", features:[] };
+    try {
+      const res = await fetch(overpassUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+        body: "data=" + encodeURIComponent(query)
+      });
+      const osm = await res.json();
+      buildingsGeo = parseOverpassToGeoJSON(osm);
+      console.log("Buildings:", buildingsGeo.features.length);
+    } catch (e) {
+      console.error("Overpass fetch failed:", e);
+    }
+
+    // 2) Add buildings source + layer (3D extrusions)
+    map.addSource("bld", { type: "geojson", data: buildingsGeo });
+
+    map.addLayer({
+      id: "bld-3d",
+      type: "fill-extrusion",
+      source: "bld",
+      minzoom: 13,
+      paint: {
+        "fill-extrusion-color": "#d9d9d9",
+        "fill-extrusion-height": ["get", "height_m"],
+        "fill-extrusion-base": 0,
+        "fill-extrusion-opacity": 0.95
+      }
+    });
+
+    // 3) Add AQI source + layer
+    const aqiGeo = {
+      type: "FeatureCollection",
+      features: aqiPts.map((p, idx) => ({
+        type: "Feature",
+        geometry: { type: "Point", coordinates: [p.lon, p.lat] },
+        properties: { idx, base: p.base, v: p.base }
+      }))
+    };
+
+    map.addSource("aqi", { type: "geojson", data: aqiGeo });
+
+    map.addLayer({
+      id: "aqi-circles",
+      type: "circle",
+      source: "aqi",
+      paint: {
+        "circle-radius": [
+          "interpolate", ["linear"], ["zoom"],
+          10, 4,
+          14, 12,
+          16, 24
+        ],
+        "circle-color": [
+          "case",
+          ["<", ["get","v"], 0.33], "#22c55e",
+          ["<", ["get","v"], 0.66], "#f59e0b",
+          "#ef4444"
+        ],
+        "circle-opacity": 0.65,
+        "circle-blur": 0.8
+      }
+    });
+
+    // 4) Click building -> popup
+    map.on("click", "bld-3d", (e) => {
+      const f = e.features && e.features[0];
+      if (!f) return;
+      const p = f.properties || {};
+      const html = `
+        <b>${p.name ? p.name : "Building"}</b><br/>
+        <div style="font-size:12px;">
+          type: ${p.building || ""}<br/>
+          height: ${Number(p.height_m).toFixed(1)} m<br/>
+          osm_id: ${p.osm_id}
+        </div>
+      `;
+      new maplibregl.Popup()
+        .setLngLat(e.lngLat)
+        .setHTML(html)
+        .addTo(map);
+    });
+
+    // 5) UI bindings
+    bldChk.onchange = () => {
+      map.setLayoutProperty("bld-3d", "visibility", bldChk.checked ? "visible" : "none");
+    };
+
+    aqiChk.onchange = () => {
+      map.setLayoutProperty("aqi-circles", "visibility", aqiChk.checked ? "visible" : "none");
+    };
+
+    aqiInt.oninput = () => {
+      const val = Number(aqiInt.value) / 100; // 0..1
+      map.setPaintProperty("aqi-circles", "circle-opacity", 0.15 + 0.75 * val);
+    };
+
+    resetBtn.onclick = () => {
+      map.easeTo({ center: CENTER, zoom: ZOOM_START, pitch: 55, bearing: -20, duration: 900 });
+    };
+
+    go3dBtn.onclick = () => {
+      map.easeTo({ pitch: 70, zoom: 15.2, bearing: -35, duration: 900 });
+    };
+
+    topBtn.onclick = () => {
+      map.easeTo({ pitch: 0, zoom: 13.8, bearing: 0, duration: 700 });
+    };
+
+    // Start with good intensity
+    aqiInt.dispatchEvent(new Event("input"));
+
+    // 6) AQI animation
+    let t = 0;
+    function tick() {
+      t += 0.01;
+      const speed = Number(aqiAnim.value) / 100; // 0..1
+      if (speed > 0.001) {
+        const data = map.getSource("aqi")._data;
+        for (const f of data.features) {
+          const base = f.properties.base;
+          // oscillate around base
+          let v = base + 0.18 * Math.sin(t * (0.6 + speed*4) + f.properties.idx);
+          v = Math.max(0, Math.min(1, v));
+          f.properties.v = v;
+        }
+        map.getSource("aqi").setData(data);
+      }
+      requestAnimationFrame(tick);
+    }
+    tick();
+
+    // Done
+    console.log("✅ Loaded: 3D buildings + AQI overlay");
+  });
+</script>
+
+</body>
+</html>
